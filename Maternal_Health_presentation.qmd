@@ -1,0 +1,315 @@
+---
+title: "Predicting Maternal Health Risk Using Routine Clinical Measurements"
+author: "Jessica Nari Yoon"
+format:
+  revealjs:
+    theme: serif
+    transition: fade
+    slide-number: true
+    code-line-numbers: false
+    toc: false
+    scrollable: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Overview 
+- Maternal health remains a major global health challenge 
+- Many complications are **predictable** from early physiological changes  
+- Goal: use **routine, low-cost measurements** to predict maternal health risk  
+- Focus on two models:
+  - Ordinal logistic regression (interpretable)
+  - Random forest (flexible, non-linear)
+
+## Background & Motivation
+- Maternal morbidity and mortality remain high worldwide  
+- Early risk stratification can:
+  - Trigger closer monitoring  
+  - Support decisions making in low-resource or outpatient settings
+- Machine learning has been used for clinical prediction  
+  - Improves risk stratification and decision support [@rajkomar2019machine]  
+- Prior maternal risk models often rely on complex features or advancing imaging and are 
+hard to interpret or implement outside tertiary centers 
+
+# Can we get reasonable three-level risk predictions using only basic vitals and demographics? 
+
+## Data: Maternal Health Risk Dataset
+- Public dataset with **1,014 patients** [@sharma2022maternal; @harnal2025predicting]  
+- Variables:
+  - Age (years), SystolicBP / DiastolicBP (mmHg)
+  - BS (blood sugar, mmol/L)
+  - BodyTemp (°F), HeartRate (bpm)
+  - RiskLevel: *low*, *mid*, *high* risk
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    balanced_accuracy_score,
+    f1_score
+)
+
+from statsmodels.miscmodels.ordinal_model import OrderedModel
+from scipy.stats import spearmanr, kruskal
+
+RANDOM_STATE = 42
+sns.set(style="whitegrid")
+
+DATA_PATH = "../data/maternal_health_risk.csv"
+
+df = pd.read_csv(DATA_PATH)
+
+features = ["Age", "SystolicBP", "DiastolicBP", "BS", "BodyTemp", "HeartRate"]
+risk_order = {"low risk": 0, "mid risk": 1, "high risk": 2}
+y_ord = df["RiskLevel"].map(risk_order)
+X = df[features].copy()
+
+# train–test split & scaling
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_ord, test_size=0.2, stratify=y_ord, random_state=RANDOM_STATE
+)
+
+scaler = StandardScaler()
+X_train_std = scaler.fit_transform(X_train)
+X_test_std = scaler.transform(X_test)
+
+# ordinal logistic regression
+ord_model = OrderedModel(y_train, X_train_std, distr="logit")
+ord_res = ord_model.fit(method="bfgs", disp=False)
+
+pred_probs_ord = ord_res.model.predict(ord_res.params, exog=X_test_std)
+y_pred_ord = np.asarray(pred_probs_ord).argmax(axis=1)
+
+bal_acc_ord = balanced_accuracy_score(y_test, y_pred_ord)
+macro_f1_ord = f1_score(y_test, y_pred_ord, average="macro")
+
+# random forest
+rf_clf = RandomForestClassifier(
+    n_estimators=300,
+    class_weight="balanced",
+    random_state=RANDOM_STATE
+)
+rf_clf.fit(X_train, y_train)
+y_pred_rf = rf_clf.predict(X_test)
+
+bal_acc_rf = balanced_accuracy_score(y_test, y_pred_rf)
+macro_f1_rf = f1_score(y_test, y_pred_rf, average="macro")
+```
+
+## Outcome Distribution and Class Imbalance 
+```{python}
+risk_counts = df["RiskLevel"].value_counts().sort_index()
+ax = risk_counts.plot(kind="bar")
+ax.set_xlabel("Risk Level")
+ax.set_ylabel("Count")
+ax.set_title("Distribution of Maternal Health Risk Levels")
+plt.tight_layout()
+plt.show()
+```
+
+- Most patients are low risk, with fewer mid and high risk 
+- Still enough high-risk cases to train models 
+- Some imbalance --> use stratified train-test split and class weights for random forest
+
+## How Do Predictors Vary by Risk? - Each Feature vs Risk Level 
+```{python}
+fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+axes = axes.flatten()
+
+for ax, col in zip(axes, features):
+    sns.boxplot(data=df, x="RiskLevel", y=col, ax=ax)
+    ax.set_title(col)
+    ax.set_xlabel("Risk Level")
+
+plt.tight_layout()
+plt.show()
+```
+
+## Key Numbers
+```{python}
+group_means = df.groupby("RiskLevel")[features].mean().round(2)
+group_means
+```
+- High-risk age ≈ 36 vs 27–28 in low/mid
+- High-risk systolic BP ≈ 124 vs 106–113
+- High-risk BS ≈ 12.1 mmol/L vs 7–8 in lower risk groups
+- Confirms clear gradients for BP, BS, and age
+
+## Key Patterns and Link to Real Life  
+- Age: high risk patients are noticeably older 
+- Systolic & Diastolic BP: stepwise increase in both systolic and diastolic BP 
+- Blood sugar: strongest gradient; high-risk mean is about 12 mmol/L (normal is about 5.6mmol/L)
+- Patterns mirror established links between
+    - Hypertension and preeclampsia-related morbility 
+    - Hypergylcemia and gestational diabetes-related complications 
+
+## Association Test 
+```{python}
+assoc_results = []
+
+for col in features:
+    rho, p_spear = spearmanr(df[col], y_ord)
+    groups = [
+    df[df["RiskLevel"] == level][col]
+    for level in ["low risk", "mid risk", "high risk"]
+]
+stat_kw, p_kw = kruskal(*groups)
+
+assoc_results.append({
+    "feature": col,
+    "spearman_rho": rho,
+    "spearman_p": p_spear,
+    "kruskal_H": stat_kw,
+    "kruskal_p": p_kw
+})
+
+assoc_df = pd.DataFrame(assoc_results)
+assoc_df.sort_values("spearman_p")
+```
+- Strongest monotonic associations with risk: Blood sugar, systolic BP, diastolic BP
+- Age moderately associated
+- Heart rate and temperatue weaker but still statistically significant 
+- Confirms that simple vitals capture clinically meaningful gradients in risk 
+
+## Methods
+- Outcome: 3-level ordinal risk (low < mid < high)
+- Predictors: six routine measurements 
+- Data Split: 80/20 stratified train-test 
+- Models: 
+    - Ordinal logistic regression 
+    - Random forest classifier (n=300 trees) 
+- Metrics 
+    - Balanced 
+    - Macro F1 
+    - 5-fold stratified cross validation for random forest
+
+## Results - Overall Model Performance 
+```{python}
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+f1_scores = cross_val_score(
+    rf_clf,           # your RandomForestClassifier
+    X,                # features
+    y_ord,            # target
+    cv=cv,
+    scoring="f1_macro"
+)
+
+bal_scores = cross_val_score(
+    rf_clf,
+    X,
+    y_ord,
+    cv=cv,
+    scoring="balanced_accuracy"
+)
+
+print(
+    "Random Forest – Macro F1:",
+    f1_scores.mean().round(3),
+    "±",
+    f1_scores.std().round(3),
+)
+print(
+    "Random Forest – Balanced accuracy:",
+    bal_scores.mean().round(3),
+    "±",
+    bal_scores.std().round(3),
+)
+```
+
+- Both models perform well above chance for 3-class prediction
+- Random forest shows modest gains in both balanced accuracy and macro F1
+- Cross-validated random forest performance is stable
+
+## Error Patterns - Random Forest 
+```{python}
+cm_rf = confusion_matrix(y_test, y_pred_rf)
+disp = ConfusionMatrixDisplay(
+confusion_matrix=cm_rf,
+display_labels=["low", "mid", "high"]
+)
+disp.plot(values_format="d")
+plt.title("Confusion Matrix — Random Forest")
+plt.tight_layout()
+plt.show()
+```
+
+## Error Patterns - Random Forest
+- Most low and high risk patients are classified correctly
+- Misclassifications mainly occur between mid and neighboring categories
+- Very few high-risk patients are misclassified as low-risk → reassuring for triage use
+- Similar error structure reported in other multi-class maternal risk models [@sharma2022maternal
+
+## What Drives Risk? – Ordinal Model Coefficients
+```{python}
+K = len(features)
+coef_ord = ord_res.params.iloc[:K]
+
+coef_series = pd.Series(coef_ord.values, index=features).sort_values(
+    key=lambda x: x.abs(), ascending=False
+)
+coef_series
+```
+
+```{python}
+ax = coef_series.abs().plot(kind="bar")
+ax.set_ylabel("|Coefficient|")
+ax.set_title("Ordinal Logistic Regression: Approximate Feature Importance")
+plt.tight_layout()
+plt.show()
+```
+
+## What Drives Risk? – Ordinal Model Coefficients
+- Largest coefficients: blood sugar and systolic BP
+- Signs and magnitudes align with known risk factors:
+- Higher BP and BS → higher odds of being in a worse risk category
+- Provides an interpretable story consistent with clinical guidelines.
+
+## What Drives Risk? – Random Forest Importance
+```{python}
+rf_importance = pd.Series(
+    rf_clf.feature_importances_,
+    index=features
+).sort_values(ascending=False)
+
+rf_importance
+```
+
+```{python}
+ax = rf_importance.plot(kind="bar")
+ax.set_ylabel("Importance")
+ax.set_title("Random Forest: Feature Importance")
+plt.tight_layout()
+plt.show()
+```
+
+## What Drives Risk? - Random Forest Importance 
+- Random forest also ranks blood sugar and blood pressure as top predictors
+- Age is next, with heart rate and temperature contributing less
+- Agreement between a transparent model and a flexible ML model increases trust
+- Echoes findings that cardiometabolic factors dominate maternal risk [@who2016pregnancy].
+
+## Conclusion and Summary
+- Using only six routine measurements, we achieve:
+- ≈ 0.8–0.83 balanced accuracy and macro F1 for 3-class maternal risk
+- Across EDA, association tests, and both models:
+    -Blood sugar and blood pressure consistently emerge as key predictors
+    -Age adds additional signal; heart rate and temperature are secondary
+- This aligns with prior work on preeclampsia and gestational diabetes risk
+and suggests that simple, interpretable tools could support triage in clinics
+that lack advanced labs or imaging.
+
+# Thank you! 
