@@ -1,0 +1,1336 @@
+---
+title: "Predictive Modeling of Ventricular Wall Stem Cell Fate"
+author: "Jessica Nari Yoon"
+jupyter: ependymal
+format:
+  revealjs:
+    theme: serif
+    transition: fade
+    slide-number: true
+    scrollable: true
+    toc: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Project goal and data
+
+- The goal of this project is to test whether a compartment-specific predictive model can use the observed P7 state to reproduce later ventricular wall composition at P14 and P30.
+- The dataset is a merged, imaging-based lab dataset summarized across six compartments defined by wall location and rostrocaudal region.
+- The main inputs are:
+  - P7 stem cell count (**S**)
+  - P7 ependymal cell count (**E**)
+  - P7 fate probabilities (**p_sym_self, p_asym**, and inferred **p_EE**)
+  - later observed composition (**pct_S_mean, pct_E_mean**)
+  - average apical area (**avg_apical_area**) as a geometry proxy
+- Because these data were generated within the lab, the final citation or acknowledgement format should be confirmed with my advisor before submission.
+
+::: notes
+This project asks whether early compartment-specific measurements are enough to predict later ventricular wall composition. I use a lab-derived imaging dataset organized into six anatomical compartments and focus on whether the observed P7 state can explain later stem cell and ependymal cell fractions.
+:::
+
+## Model, assumptions, and validation
+
+- I model each compartment as a two-population system:
+  - **S(t)** = stem cells
+  - **E(t)** = ependymal cells
+- The number of dividing stem cells is modeled with a **binomial distribution**, and division outcomes are modeled with a **multinomial distribution**.
+- The model uses a daily time step, apical-area interpolation, Huber loss, regularization, and Monte Carlo simulation for uncertainty.
+- Key assumptions:
+  - ependymal cells are treated as non-dividing
+  - migration, cell death, and measurement error are not modeled explicitly
+  - apical area is treated as a proxy for tissue geometry
+- Validation is based mainly on **RMSE, MAE, predicted-versus-observed plots, residuals, and compartment-specific SC/EC trajectories**.
+
+::: notes
+I chose a probabilistic model because stem cell fate is variable and compartment-specific. The binomial step captures whether a stem cell divides, and the multinomial step captures which fate that division takes. I keep the assumptions simple so the model stays interpretable, then evaluate it with both error metrics and graphical validation.
+:::
+
+
+
+```{python}
+#| include: false
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+import matplotlib.pyplot as plt
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.interpolate import UnivariateSpline
+from scipy.optimize import minimize
+
+plt.rcParams.update({
+    "figure.dpi": 140,
+    "savefig.dpi": 300,
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 9,
+})
+
+
+def find_csv(filename: str = "combined_modeling_table.csv") -> Path:
+    candidates = [
+        Path(filename),
+        Path("data") / filename,
+        Path("..") / filename,
+        Path("..") / "data" / filename,
+        Path("/Users/jessicayoon/Desktop/capstone_joanne/combined_modeling_table.csv"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"Could not find {filename}. Put it in the same folder as this QMD or in a data/ folder."
+    )
+
+
+# =========================================================
+# Basic helpers
+# =========================================================
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def softmax_rows(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=float)
+    z = z - np.max(z, axis=-1, keepdims=True)
+    ez = np.exp(z)
+    return ez / np.sum(ez, axis=-1, keepdims=True)
+
+
+def time_to_day(time_label) -> float:
+    s = str(time_label).strip()
+    if s.upper().startswith("P"):
+        return float(s[1:])
+    return float(s)
+
+
+def safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+
+def to_unit_fraction(values) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    finite = np.isfinite(arr)
+    if finite.any() and np.nanmax(arr[finite]) > 1.5:
+        arr = arr / 100.0
+    return arr
+
+
+def huber_loss(resid: np.ndarray, delta: float = 0.05) -> np.ndarray:
+    resid = np.asarray(resid, dtype=float)
+    a = np.abs(resid)
+    return np.where(a <= delta, 0.5 * resid**2, delta * (a - 0.5 * delta))
+
+
+# =========================================================
+# Injection schedule
+# =========================================================
+@dataclass
+class InjectionEvent:
+    name: str
+    t0: float
+    window: float
+    dose: float = 1.0
+
+
+def make_injection_design(
+    t: np.ndarray,
+    injections: Optional[List[InjectionEvent]],
+    kernel: str = "boxcar",
+) -> Tuple[np.ndarray, List[str]]:
+    if not injections:
+        return np.zeros((len(t), 0)), []
+
+    X = np.zeros((len(t), len(injections)), dtype=float)
+    names = []
+
+    for j, inj in enumerate(injections):
+        names.append(f"inj_{inj.name}")
+        if kernel == "boxcar":
+            mask = (t >= inj.t0) & (t <= inj.t0 + inj.window)
+            X[mask, j] = inj.dose
+        elif kernel == "exp":
+            mask = t >= inj.t0
+            tau = max(inj.window, 1e-6)
+            X[mask, j] = inj.dose * np.exp(-(t[mask] - inj.t0) / tau)
+        else:
+            raise ValueError("kernel must be 'boxcar' or 'exp'")
+
+    return X, names
+
+
+# =========================================================
+# Model config
+# =========================================================
+@dataclass
+class ModelConfig:
+    dt: float = 1.0
+    n_sims_predict: int = 500
+    seed: int = 42
+    loss: str = "huber"
+    huber_delta: float = 0.05
+    l2_r: float = 1.0
+    l2_p: float = 1.0
+    reg_weight: float = 1e-3
+    anchor_weight: float = 0.05
+    maxiter: int = 300
+    inj_kernel: str = "boxcar"
+    day_weights: Dict[float, float] = field(default_factory=lambda: {14.0: 0.6, 30.0: 1.0})
+    area_use_spline: bool = False
+    area_smoothing: float = 0.0
+    time_scale: float = 30.0
+    ec_initial_logits: Tuple[float, float, float] = (-1.4, 0.9, 0.6)
+
+
+# =========================================================
+# Apical area interpolation
+# =========================================================
+class ApicalAreaModel:
+    def __init__(self, smoothing: float = 0.0, use_spline: bool = False):
+        self.smoothing = smoothing
+        self.use_spline = use_spline
+        self.models: Dict[Tuple[str, str], Callable[[np.ndarray], np.ndarray]] = {}
+
+    def fit(
+        self,
+        df: pd.DataFrame,
+        time_col: str = "time",
+        wall_col: str = "wall",
+        region_col: str = "region",
+        area_col: str = "avg_apical_area",
+    ):
+        self.models = {}
+
+        for (wall, region), g in df.groupby([wall_col, region_col]):
+            g = g.copy()
+            g["day"] = g[time_col].apply(time_to_day)
+            g[area_col] = pd.to_numeric(g[area_col], errors="coerce")
+            g = g.dropna(subset=["day", area_col]).sort_values("day")
+
+            if len(g) == 0:
+                self.models[(wall, region)] = lambda t: np.full_like(np.asarray(t, dtype=float), np.nan, dtype=float)
+                continue
+
+            x = g["day"].to_numpy(dtype=float)
+            y = g[area_col].to_numpy(dtype=float)
+
+            if len(np.unique(x)) == 1:
+                y0 = float(y[0])
+                self.models[(wall, region)] = lambda t, y0=y0: np.full_like(np.asarray(t, dtype=float), y0, dtype=float)
+                continue
+
+            if self.use_spline and len(np.unique(x)) >= 3:
+                spline = UnivariateSpline(x, y, s=self.smoothing)
+                self.models[(wall, region)] = lambda t, spline=spline: spline(np.asarray(t, dtype=float))
+            else:
+                self.models[(wall, region)] = lambda t, x=x, y=y: np.interp(
+                    np.asarray(t, dtype=float), x, y, left=y[0], right=y[-1]
+                )
+
+    def predict(self, wall: str, region: str, t: np.ndarray) -> np.ndarray:
+        if (wall, region) not in self.models:
+            return np.full_like(np.asarray(t, dtype=float), np.nan, dtype=float)
+        return np.asarray(self.models[(wall, region)](np.asarray(t, dtype=float)), dtype=float)
+
+
+# =========================================================
+# Main model
+# =========================================================
+class AdvancedVWModel:
+    def __init__(self, cfg: Optional[ModelConfig] = None):
+        self.cfg = cfg or ModelConfig()
+        self.area_model = ApicalAreaModel(
+            smoothing=self.cfg.area_smoothing,
+            use_spline=self.cfg.area_use_spline,
+        )
+        self.injections: List[InjectionEvent] = []
+        self.wall_levels: List[str] = []
+        self.region_levels: List[str] = []
+        self.br: Optional[np.ndarray] = None
+        self.Bp: Optional[np.ndarray] = None
+        self.r_feat_names: List[str] = []
+        self.p_feat_names: List[str] = []
+
+    def _build_design(
+        self,
+        wall: str,
+        region: str,
+        t: np.ndarray,
+        area: np.ndarray,
+        injections: Optional[List[InjectionEvent]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+        t = np.asarray(t, dtype=float)
+        area = np.asarray(area, dtype=float)
+        t_scaled = t / self.cfg.time_scale
+
+        area_center = np.nanmean(area)
+        area_sd = np.nanstd(area)
+        if not np.isfinite(area_sd) or area_sd < 1e-8:
+            area_z = np.zeros_like(area)
+        else:
+            area_z = (area - area_center) / area_sd
+
+        cols = [
+            np.ones_like(t),
+            t_scaled,
+            t_scaled**2,
+            area_z,
+        ]
+        names = ["intercept", "time", "time2", "area_z"]
+
+        for w in self.wall_levels[1:]:
+            cols.append(np.full_like(t, float(wall == w)))
+            names.append(f"wall_{w}")
+
+        for r in self.region_levels[1:]:
+            cols.append(np.full_like(t, float(region == r)))
+            names.append(f"region_{r}")
+
+        Xinj, inj_names = make_injection_design(t, injections, kernel=self.cfg.inj_kernel)
+        for j in range(Xinj.shape[1]):
+            cols.append(Xinj[:, j])
+        names.extend(inj_names)
+
+        X = np.column_stack(cols).astype(float)
+        return X, X.copy(), names.copy(), names.copy()
+
+    def _simulate_expected_path(
+        self,
+        S0: float,
+        E0: float,
+        t_grid: np.ndarray,
+        Xr: np.ndarray,
+        Xp: np.ndarray,
+        br: np.ndarray,
+        Bp: np.ndarray,
+    ) -> np.ndarray:
+        S = float(S0)
+        E = float(E0)
+        pctS_path = []
+
+        for i in range(len(t_grid)):
+            total = max(S + E, 1e-9)
+            pctS_path.append(S / total)
+
+            if i == len(t_grid) - 1:
+                break
+
+            dt = float(t_grid[i + 1] - t_grid[i])
+            r = sigmoid(Xr[i] @ br)
+            r_eff = np.clip(r * dt, 0.0, 1.0)
+            p = softmax_rows((Xp[i:i + 1] @ Bp))[0]
+            pSS, pAS, pEE = p
+
+            dividing = S * r_eff
+            nSS = dividing * pSS
+            nAS = dividing * pAS
+            nEE = dividing * pEE
+
+            S = max(S + nSS - nEE, 0.0)
+            E = max(E + nAS + 2.0 * nEE, 0.0)
+
+        return np.asarray(pctS_path, dtype=float)
+
+    def _simulate_paths(
+        self,
+        S0: int,
+        E0: int,
+        t_grid: np.ndarray,
+        Xr: np.ndarray,
+        Xp: np.ndarray,
+        br: np.ndarray,
+        Bp: np.ndarray,
+        n_sims: Optional[int] = None,
+    ) -> np.ndarray:
+        n_sims = n_sims or self.cfg.n_sims_predict
+        paths = np.zeros((n_sims, len(t_grid)), dtype=float)
+
+        rng = np.random.default_rng(self.cfg.seed)
+
+        for s in range(n_sims):
+            S = int(round(S0))
+            E = int(round(E0))
+
+            for i in range(len(t_grid)):
+                total = max(S + E, 1)
+                paths[s, i] = S / total
+
+                if i == len(t_grid) - 1:
+                    break
+
+                dt = float(t_grid[i + 1] - t_grid[i])
+                r = sigmoid(Xr[i] @ br)
+                r_eff = np.clip(r * dt, 0.0, 1.0)
+                p = softmax_rows((Xp[i:i + 1] @ Bp))[0]
+
+                dividing = rng.binomial(S, r_eff)
+                if dividing > 0:
+                    nSS, nAS, nEE = rng.multinomial(dividing, p)
+                else:
+                    nSS = nAS = nEE = 0
+
+                S = max(S + nSS - nEE, 0)
+                E = max(E + nAS + 2 * nEE, 0)
+
+        return paths
+
+    def _prepare_fit_cache(
+        self,
+        df: pd.DataFrame,
+        time_col: str,
+        wall_col: str,
+        region_col: str,
+        S_col: str,
+        E_col: str,
+        pSS_col: str,
+        pAS_col: str,
+        area_col: str,
+        obs_pctS_col: str,
+        fit_to_times: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        out = []
+
+        if fit_to_times is not None:
+            fit_days = sorted([time_to_day(x) for x in fit_to_times])
+        else:
+            fit_days = None
+
+        for (wall, region), g in df.groupby([wall_col, region_col]):
+            g = g.copy()
+            g["day"] = g[time_col].apply(time_to_day)
+            g = g.sort_values("day")
+
+            gP7 = g[g["day"] == 7.0]
+            if len(gP7) == 0:
+                continue
+
+            base = gP7.iloc[0]
+            S0 = int(round(float(base[S_col])))
+            E0 = int(round(float(base[E_col])))
+
+            y_obs = to_unit_fraction(g[obs_pctS_col].to_numpy(dtype=float))
+            t_obs = g["day"].to_numpy(dtype=float)
+
+            mask = np.isfinite(y_obs) & np.isfinite(t_obs) & (t_obs >= 7.0)
+            if fit_days is not None:
+                mask = mask & np.isin(t_obs, fit_days)
+
+            y_obs = y_obs[mask]
+            t_obs = t_obs[mask]
+            if len(t_obs) == 0:
+                continue
+
+            t_grid = np.arange(7.0, float(np.max(t_obs)) + 1e-9, self.cfg.dt, dtype=float)
+            A = self.area_model.predict(wall, region, t_grid)
+            if np.any(~np.isfinite(A)):
+                median_a = np.nanmedian(A)
+                if not np.isfinite(median_a):
+                    median_a = 0.0
+                A = np.where(np.isfinite(A), A, median_a)
+
+            Xr, Xp, _, _ = self._build_design(wall, region, t_grid, A, self.injections)
+            Xp7, _, _, _ = self._build_design(
+                wall,
+                region,
+                np.array([7.0], dtype=float),
+                self.area_model.predict(wall, region, np.array([7.0], dtype=float)),
+                self.injections,
+            )
+
+            p_anchor = None
+            pSS = safe_float(base.get(pSS_col, np.nan))
+            pAS = safe_float(base.get(pAS_col, np.nan))
+            if np.isfinite(pSS) and np.isfinite(pAS):
+                if pSS > 1.5 or pAS > 1.5:
+                    pSS = pSS / 100.0
+                    pAS = pAS / 100.0
+                pEE = np.clip(1.0 - pSS - pAS, 0.0, 1.0)
+                total = pSS + pAS + pEE
+                if total > 0:
+                    p_anchor = np.array([pSS, pAS, pEE], dtype=float) / total
+
+            obs_weights = np.array([self.cfg.day_weights.get(float(day), 1.0) for day in t_obs], dtype=float)
+
+            out.append(
+                {
+                    "wall": wall,
+                    "region": region,
+                    "S0": S0,
+                    "E0": E0,
+                    "t_obs": t_obs,
+                    "y_obs": y_obs,
+                    "t_grid": t_grid,
+                    "Xr": Xr,
+                    "Xp": Xp,
+                    "Xp7": Xp7,
+                    "p_anchor": p_anchor,
+                    "obs_weights": obs_weights,
+                }
+            )
+
+        return out
+
+    def fit(
+        self,
+        df: pd.DataFrame,
+        injections: Optional[List[InjectionEvent]] = None,
+        time_col: str = "time",
+        wall_col: str = "wall",
+        region_col: str = "region",
+        S_col: str = "S",
+        E_col: str = "E",
+        pSS_col: str = "p_sym_self",
+        pAS_col: str = "p_asym",
+        area_col: str = "avg_apical_area",
+        obs_pctS_col: str = "pct_S_mean",
+        fit_to_times: Optional[List[str]] = None,
+    ):
+        self.injections = injections or []
+        self.wall_levels = sorted(df[wall_col].dropna().astype(str).unique().tolist())
+        self.region_levels = sorted(df[region_col].dropna().astype(str).unique().tolist())
+
+        self.area_model.fit(
+            df=df,
+            time_col=time_col,
+            wall_col=wall_col,
+            region_col=region_col,
+            area_col=area_col,
+        )
+
+        wall0 = self.wall_levels[0]
+        region0 = self.region_levels[0]
+        t_tmp = np.array([7.0, 14.0, 30.0], dtype=float)
+        A_tmp = self.area_model.predict(wall0, region0, t_tmp)
+        med_tmp = np.nanmedian(A_tmp)
+        if not np.isfinite(med_tmp):
+            med_tmp = 0.0
+        A_tmp = np.where(np.isfinite(A_tmp), A_tmp, med_tmp)
+
+        Xr_tmp, Xp_tmp, r_names, p_names = self._build_design(wall0, region0, t_tmp, A_tmp, self.injections)
+        Dr = Xr_tmp.shape[1]
+        Dp = Xp_tmp.shape[1]
+
+        self.r_feat_names = r_names
+        self.p_feat_names = p_names
+
+        br0 = np.zeros(Dr, dtype=float)
+        Bp0 = np.zeros((Dp, 3), dtype=float)
+        Bp0[0, :] = np.array(self.cfg.ec_initial_logits, dtype=float)
+
+        x0 = np.concatenate([br0, Bp0.ravel()])
+
+        fit_cache = self._prepare_fit_cache(
+            df=df,
+            time_col=time_col,
+            wall_col=wall_col,
+            region_col=region_col,
+            S_col=S_col,
+            E_col=E_col,
+            pSS_col=pSS_col,
+            pAS_col=pAS_col,
+            area_col=area_col,
+            obs_pctS_col=obs_pctS_col,
+            fit_to_times=fit_to_times,
+        )
+
+        if len(fit_cache) == 0:
+            raise ValueError("No valid compartments available for fitting.")
+
+        def objective(theta: np.ndarray) -> float:
+            br = theta[:Dr]
+            Bp = theta[Dr:].reshape(Dp, 3)
+
+            total_loss = 0.0
+            total_weight = 0.0
+            anchor = 0.0
+
+            for item in fit_cache:
+                mean_path = self._simulate_expected_path(
+                    S0=item["S0"],
+                    E0=item["E0"],
+                    t_grid=item["t_grid"],
+                    Xr=item["Xr"],
+                    Xp=item["Xp"],
+                    br=br,
+                    Bp=Bp,
+                )
+                yhat = np.interp(item["t_obs"], item["t_grid"], mean_path)
+                resid = yhat - item["y_obs"]
+                w = item["obs_weights"]
+
+                if self.cfg.loss.lower() == "huber":
+                    total_loss += float(np.sum(w * huber_loss(resid, self.cfg.huber_delta)))
+                elif self.cfg.loss.lower() == "l2":
+                    total_loss += float(np.sum(w * resid**2))
+                else:
+                    raise ValueError("cfg.loss must be 'huber' or 'l2'")
+
+                total_weight += float(np.sum(w))
+
+                if item["p_anchor"] is not None:
+                    p7 = softmax_rows(item["Xp7"] @ Bp)[0]
+                    anchor += float(np.sum((p7 - item["p_anchor"]) ** 2))
+
+            reg = self.cfg.l2_r * np.sum(br[1:] ** 2) + self.cfg.l2_p * np.sum(Bp[1:, :] ** 2)
+            return total_loss / max(total_weight, 1.0) + self.cfg.anchor_weight * anchor + self.cfg.reg_weight * reg
+
+        res = minimize(
+            objective,
+            x0,
+            method="L-BFGS-B",
+            options={"maxiter": self.cfg.maxiter},
+        )
+
+        theta_hat = res.x
+        self.br = theta_hat[:Dr]
+        self.Bp = theta_hat[Dr:].reshape(Dp, 3)
+        return res
+
+    def predict(
+        self,
+        df: pd.DataFrame,
+        wall: str,
+        region: str,
+        t_query: float,
+        time_col: str = "time",
+        wall_col: str = "wall",
+        region_col: str = "region",
+        S_col: str = "S",
+        E_col: str = "E",
+        return_paths: bool = False,
+        use_monte_carlo: bool = True,
+        n_sims: Optional[int] = None,
+    ) -> Dict:
+        if self.br is None or self.Bp is None:
+            raise RuntimeError("Model has not been fit yet.")
+
+        g = df[(df[wall_col] == wall) & (df[region_col] == region)].copy()
+        g["day"] = g[time_col].apply(time_to_day)
+        g = g.sort_values("day")
+
+        gP7 = g[g["day"] == 7.0]
+        if len(gP7) == 0:
+            raise ValueError(f"No P7 row found for wall={wall}, region={region}")
+
+        base = gP7.iloc[0]
+        S0 = int(round(float(base[S_col])))
+        E0 = int(round(float(base[E_col])))
+
+        t_grid = np.arange(7.0, float(t_query) + 1e-9, self.cfg.dt, dtype=float)
+        A = self.area_model.predict(wall, region, t_grid)
+        if np.any(~np.isfinite(A)):
+            median_a = np.nanmedian(A)
+            if not np.isfinite(median_a):
+                median_a = 0.0
+            A = np.where(np.isfinite(A), A, median_a)
+
+        Xr, Xp, _, _ = self._build_design(wall, region, t_grid, A, self.injections)
+
+        if use_monte_carlo:
+            paths = self._simulate_paths(
+                S0=S0,
+                E0=E0,
+                t_grid=t_grid,
+                Xr=Xr,
+                Xp=Xp,
+                br=self.br,
+                Bp=self.Bp,
+                n_sims=n_sims,
+            )
+            mean_path = np.mean(paths, axis=0)
+            out = {
+                "t_query": float(t_query),
+                "pctS_mean": float(mean_path[-1]),
+                "pctS_lo10": float(np.percentile(paths[:, -1], 10)),
+                "pctS_hi90": float(np.percentile(paths[:, -1], 90)),
+            }
+            if return_paths:
+                out["t_grid"] = t_grid
+                out["pctS_paths"] = paths
+                out["pctS_mean_path"] = mean_path
+            return out
+
+        mean_path = self._simulate_expected_path(
+            S0=S0,
+            E0=E0,
+            t_grid=t_grid,
+            Xr=Xr,
+            Xp=Xp,
+            br=self.br,
+            Bp=self.Bp,
+        )
+        out = {"t_query": float(t_query), "pctS_mean": float(mean_path[-1])}
+        if return_paths:
+            out["t_grid"] = t_grid
+            out["pctS_mean_path"] = mean_path
+        return out
+
+    def describe(self):
+        if self.br is None or self.Bp is None:
+            print("Model not fit yet.")
+            return
+        print("r(t) feature names:", self.r_feat_names)
+        print("p(t) feature names:", self.p_feat_names)
+        print("br:", np.round(self.br, 4))
+        print("Bp intercept logits:", np.round(self.Bp[0], 4))
+        print("Baseline fate probs (P7-like intercept only):", np.round(softmax_rows(self.Bp[0][None, :])[0], 4))
+
+
+# =========================================================
+# Evaluation + plotting
+# =========================================================
+def evaluate_all_observed_points(
+    model: AdvancedVWModel,
+    df: pd.DataFrame,
+    time_col: str = "time",
+    wall_col: str = "wall",
+    region_col: str = "region",
+    obs_pctS_col: str = "pct_S_mean",
+):
+    rows = []
+
+    for (wall, region), g in df.groupby([wall_col, region_col]):
+        g = g.copy()
+        g["day"] = g[time_col].apply(time_to_day)
+        g = g.sort_values("day")
+
+        for _, row in g.iterrows():
+            day = float(row["day"])
+            y_obs = to_unit_fraction([safe_float(row[obs_pctS_col])])[0]
+            if not np.isfinite(y_obs) or day < 7:
+                continue
+
+            pred = model.predict(
+                df=df,
+                wall=wall,
+                region=region,
+                t_query=day,
+                use_monte_carlo=False,
+                return_paths=False,
+                time_col=time_col,
+                wall_col=wall_col,
+                region_col=region_col,
+            )
+            y_pred = float(pred["pctS_mean"])
+
+            rows.append(
+                {
+                    "wall": wall,
+                    "region": region,
+                    "day": day,
+                    "observed_pctS": y_obs,
+                    "predicted_pctS": y_pred,
+                    "residual": y_pred - y_obs,
+                    "abs_error": abs(y_pred - y_obs),
+                    "sq_error": (y_pred - y_obs) ** 2,
+                }
+            )
+
+    eval_df = pd.DataFrame(rows)
+    overall_mae = eval_df["abs_error"].mean()
+    overall_rmse = np.sqrt(eval_df["sq_error"].mean())
+
+    by_comp = (
+        eval_df.groupby(["wall", "region"])
+        .agg(
+            MAE=("abs_error", "mean"),
+            RMSE=("sq_error", lambda x: np.sqrt(np.mean(x))),
+            n=("day", "count"),
+        )
+        .reset_index()
+    )
+
+    return eval_df, overall_mae, overall_rmse, by_comp
+
+
+def summarize_timepoint_errors(eval_df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        eval_df.groupby("day")
+        .agg(
+            MAE=("abs_error", "mean"),
+            RMSE=("sq_error", lambda x: np.sqrt(np.mean(x))),
+            mean_residual=("residual", "mean"),
+            n=("day", "count"),
+        )
+        .reset_index()
+        .sort_values("day")
+    )
+
+
+def predict_full_compartment_path(
+    model: AdvancedVWModel,
+    df: pd.DataFrame,
+    wall: str,
+    region: str,
+    time_col: str = "time",
+    wall_col: str = "wall",
+    region_col: str = "region",
+    S_col: str = "S",
+    E_col: str = "E",
+    day_min: float = 7.0,
+    day_max: Optional[float] = None,
+    use_monte_carlo: bool = True,
+    n_sims: Optional[int] = None,
+) -> pd.DataFrame:
+    g = df[(df[wall_col] == wall) & (df[region_col] == region)].copy()
+    g["day"] = g[time_col].apply(time_to_day)
+    g = g.sort_values("day")
+
+    gP7 = g[g["day"] == 7.0]
+    if len(gP7) == 0:
+        raise ValueError(f"No P7 row found for wall={wall}, region={region}")
+
+    base = gP7.iloc[0]
+    S0 = int(round(float(base[S_col])))
+    E0 = int(round(float(base[E_col])))
+
+    if day_max is None:
+        day_max = float(np.nanmax(g["day"]))
+
+    t_grid = np.arange(day_min, float(day_max) + 1e-9, model.cfg.dt, dtype=float)
+    A = model.area_model.predict(wall, region, t_grid)
+    if np.any(~np.isfinite(A)):
+        median_a = np.nanmedian(A)
+        if not np.isfinite(median_a):
+            median_a = 0.0
+        A = np.where(np.isfinite(A), A, median_a)
+
+    Xr, Xp, _, _ = model._build_design(wall, region, t_grid, A, model.injections)
+
+    if use_monte_carlo:
+        paths = model._simulate_paths(
+            S0=S0,
+            E0=E0,
+            t_grid=t_grid,
+            Xr=Xr,
+            Xp=Xp,
+            br=model.br,
+            Bp=model.Bp,
+            n_sims=n_sims,
+        )
+        pctS_mean = paths.mean(axis=0)
+        pctS_lo10 = np.percentile(paths, 10, axis=0)
+        pctS_hi90 = np.percentile(paths, 90, axis=0)
+    else:
+        pctS_mean = model._simulate_expected_path(
+            S0=S0,
+            E0=E0,
+            t_grid=t_grid,
+            Xr=Xr,
+            Xp=Xp,
+            br=model.br,
+            Bp=model.Bp,
+        )
+        pctS_lo10 = np.full_like(pctS_mean, np.nan)
+        pctS_hi90 = np.full_like(pctS_mean, np.nan)
+
+    out = pd.DataFrame(
+        {
+            "day": t_grid,
+            "pctS_mean": pctS_mean,
+            "pctS_lo10": pctS_lo10,
+            "pctS_hi90": pctS_hi90,
+        }
+    )
+    out["pctE_mean"] = 1.0 - out["pctS_mean"]
+    out["pctE_lo10"] = 1.0 - out["pctS_hi90"]
+    out["pctE_hi90"] = 1.0 - out["pctS_lo10"]
+    return out
+
+
+def plot_raw_data(
+    df: pd.DataFrame,
+    time_col: str = "time",
+    wall_col: str = "wall",
+    region_col: str = "region",
+    obs_pctS_col: str = "pct_S_mean",
+    obs_pctE_col: str = "pct_E_mean",
+    p14_color: str = "darkorange",
+    figsize=(10, 5),
+):
+    plot_df = df.copy()
+    plot_df["day"] = plot_df[time_col].apply(time_to_day)
+    is_p14 = plot_df["day"] == 14.0
+    days_sorted = sorted(plot_df["day"].unique())
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharey=False)
+
+    for ax, col, ylabel, base_color in [
+        (axes[0], obs_pctS_col, "%SC (observed)", "steelblue"),
+        (axes[1], obs_pctE_col, "%EC (observed)", "tomato"),
+    ]:
+        vals = to_unit_fraction(plot_df[col].apply(safe_float).values)
+        valid = np.isfinite(vals)
+
+        ax.scatter(
+            plot_df.loc[valid & ~is_p14, "day"],
+            vals[valid & ~is_p14],
+            s=55, color=base_color, alpha=0.65, zorder=3,
+            label="Observed",
+        )
+        ax.scatter(
+            plot_df.loc[valid & is_p14, "day"],
+            vals[valid & is_p14],
+            s=100, color=p14_color, marker="D", alpha=0.9, zorder=4,
+            label="P14",
+        )
+
+        ax.set_xticks(days_sorted)
+        ax.set_xticklabels([f"P{int(d)}" for d in days_sorted])
+        ax.set_xlabel("Postnatal day")
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(-0.02, 1.05)
+        ax.legend()
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    plt.suptitle("Raw observed data across all compartments")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_compartment_fit_with_EC(
+    model,
+    df: pd.DataFrame,
+    wall: str,
+    region: str,
+    time_col: str = "time",
+    wall_col: str = "wall",
+    region_col: str = "region",
+    obs_pctS_col: str = "pct_S_mean",
+    obs_pctE_col: str = "pct_E_mean",
+    obs_err_col: Optional[str] = None,
+    day_min: float = 7.0,
+    day_max: Optional[float] = None,
+    n_sims: int = 500,
+    p14_color: str = "darkorange",
+    figsize=(8, 9),
+):
+    g = df[(df[wall_col] == wall) & (df[region_col] == region)].copy()
+    if len(g) == 0:
+        raise ValueError(f"No rows found for wall={wall}, region={region}")
+
+    g["day"] = g[time_col].apply(time_to_day)
+    g = g.sort_values("day")
+
+    if day_max is None:
+        day_max = float(np.nanmax(g["day"]))
+
+    pred_days = np.arange(day_min, day_max + 1e-9, model.cfg.dt)
+    pmean, plo, phi = [], [], []
+
+    for day in pred_days:
+        out = model.predict(
+            df=df, wall=wall, region=region,
+            t_query=float(day),
+            use_monte_carlo=True, n_sims=n_sims, return_paths=False,
+            time_col=time_col, wall_col=wall_col, region_col=region_col,
+        )
+        pmean.append(out["pctS_mean"])
+        plo.append(out["pctS_lo10"])
+        phi.append(out["pctS_hi90"])
+
+    sc_mean = np.array(pmean)
+    sc_lo = np.array(plo)
+    sc_hi = np.array(phi)
+    ec_mean = 1.0 - sc_mean
+    ec_lo = 1.0 - sc_hi
+    ec_hi = 1.0 - sc_lo
+
+    obs_days = g["day"].values.astype(float)
+    obs_sc = to_unit_fraction(g[obs_pctS_col].apply(safe_float).values)
+    obs_ec = to_unit_fraction(g[obs_pctE_col].apply(safe_float).values)
+    is_p14 = obs_days == 14.0
+
+    obs_err = (
+        g[obs_err_col].apply(safe_float).values
+        if (obs_err_col and obs_err_col in g.columns)
+        else None
+    )
+
+    xticks = sorted(set(obs_days.tolist() + [7.0]))
+
+    fig, axes = plt.subplots(2, 1, figsize=figsize)
+
+    def _draw_panel(ax, pred_mean, pred_lo, pred_hi, obs_vals, base_color, ylabel, title_text):
+        ax.fill_between(pred_days, pred_lo, pred_hi, alpha=0.18, color=base_color, label="10–90% MC interval")
+        ax.plot(pred_days, pred_mean, linewidth=2.2, color=base_color, label="Predicted trajectory")
+
+        valid_non14 = ~is_p14 & np.isfinite(obs_vals)
+        valid_p14 = is_p14 & np.isfinite(obs_vals)
+
+        if obs_err is not None:
+            ax.errorbar(
+                obs_days[valid_non14], obs_vals[valid_non14],
+                yerr=obs_err[valid_non14], fmt="o", color=base_color,
+                capsize=4, label="Observed ± error", zorder=4,
+            )
+        else:
+            ax.scatter(obs_days[valid_non14], obs_vals[valid_non14], s=70, color=base_color, label="Observed", zorder=4)
+
+        if np.any(valid_p14):
+            ax.scatter(obs_days[valid_p14], obs_vals[valid_p14], s=120, color=p14_color, marker="D", label="P14", zorder=5)
+
+        ax.set_xlabel("Postnatal day")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title_text)
+        ax.set_ylim(-0.02, 1.05)
+        ax.set_xticks(xticks)
+        ax.set_xticklabels([f"P{int(d)}" for d in xticks])
+        ax.legend(loc="best")
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+
+    _draw_panel(axes[0], sc_mean, sc_lo, sc_hi, obs_sc, "steelblue", "%SC", f"%SC: {wall} wall, {region} region")
+    _draw_panel(axes[1], ec_mean, ec_lo, ec_hi, obs_ec, "tomato", "%EC", f"%EC: {wall} wall, {region} region")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_predicted_vs_observed(eval_df: pd.DataFrame, title: str = "Predicted vs observed %SC"):
+    obs = eval_df["observed_pctS"].to_numpy(dtype=float)
+    pred = eval_df["predicted_pctS"].to_numpy(dtype=float)
+    lo = float(np.nanmin(np.r_[obs, pred]))
+    hi = float(np.nanmax(np.r_[obs, pred]))
+
+    plt.figure(figsize=(5.5, 5.5))
+    plt.scatter(obs, pred, s=70)
+    plt.plot([lo, hi], [lo, hi], linestyle="--")
+    plt.xlabel("Observed %SC")
+    plt.ylabel("Predicted %SC")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_residuals_by_time(eval_df: pd.DataFrame):
+    plt.figure(figsize=(6.5, 4.5))
+    plt.scatter(eval_df["day"], eval_df["residual"], s=60)
+    plt.axhline(0.0, linestyle="--")
+    plt.xlabel("Postnatal day")
+    plt.ylabel("Residual (predicted - observed)")
+    plt.title("Residuals by postnatal day")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_rmse_by_compartment(by_comp: pd.DataFrame):
+    tmp = by_comp.copy().sort_values("RMSE", ascending=False)
+    tmp["comp"] = tmp["wall"].str[0].str.upper() + "W-" + tmp["region"].str[0].str.upper()
+    plt.figure(figsize=(8.5, 4.5))
+    plt.bar(tmp["comp"], tmp["RMSE"])
+    plt.ylabel("RMSE")
+    plt.xlabel("Compartment")
+    plt.title("RMSE by compartment")
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_timepoint_errors(time_err: pd.DataFrame):
+    tmp = time_err.copy().sort_values("day")
+    x = np.arange(len(tmp))
+    width = 0.35
+    plt.figure(figsize=(7.5, 4.5))
+    plt.bar(x - width/2, tmp["MAE"], width=width, label="MAE")
+    plt.bar(x + width/2, tmp["RMSE"], width=width, label="RMSE")
+    plt.xticks(x, [f"P{int(d)}" for d in tmp["day"]])
+    plt.ylabel("Error")
+    plt.xlabel("Timepoint")
+    plt.title("Prediction error by timepoint")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_all_ec_trajectories(model: AdvancedVWModel, df: pd.DataFrame, n_sims: int = 500):
+    pairs = (
+        df[["wall", "region"]]
+        .drop_duplicates()
+        .sort_values(["wall", "region"])
+        .itertuples(index=False, name=None)
+    )
+
+    pairs = list(pairs)
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6.5), sharey=True)
+    axes = axes.ravel()
+
+    for ax, (wall, region) in zip(axes, pairs):
+        path_df = predict_full_compartment_path(model, df, wall, region, n_sims=n_sims)
+        g = df[(df["wall"] == wall) & (df["region"] == region)].copy()
+        g["day"] = g["time"].apply(time_to_day)
+        g = g.sort_values("day")
+        obs_ec = to_unit_fraction(g["pct_E_mean"].apply(safe_float).values)
+
+        ax.fill_between(path_df["day"], path_df["pctE_lo10"], path_df["pctE_hi90"], alpha=0.18)
+        ax.plot(path_df["day"], path_df["pctE_mean"], linewidth=2)
+        ax.scatter(g["day"], obs_ec, s=55, zorder=3)
+        ax.set_title(f"{wall.capitalize()} / {region.capitalize()}")
+        ax.set_xlabel("Day")
+        ax.set_ylim(-0.02, 1.05)
+        if wall == "lateral" and region == "rostral":
+            ax.set_ylabel("%EC")
+
+    fig.suptitle("Predicted and observed %EC across all compartments")
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================================================
+# Run analysis
+# =========================================================
+df = pd.read_csv(find_csv())
+df["wall"] = df["wall"].astype(str).str.strip().str.lower()
+df["region"] = df["region"].astype(str).str.strip().str.lower().replace({"mid": "middle"})
+df["time"] = df["time"].astype(str).str.strip()
+
+for col in ["S", "E", "p_sym_self", "p_asym", "avg_apical_area", "pct_S_mean", "pct_E_mean"]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+if "pct_E_mean" not in df.columns and {"pct_S_mean"}.issubset(df.columns):
+    df["pct_E_mean"] = 1.0 - to_unit_fraction(df["pct_S_mean"])
+
+injections: List[InjectionEvent] = []
+
+cfg = ModelConfig(
+    dt=1.0,
+    n_sims_predict=500,
+    seed=42,
+    l2_r=1.0,
+    l2_p=1.0,
+    reg_weight=1e-3,
+    anchor_weight=0.05,
+    maxiter=250,
+    loss="huber",
+    huber_delta=0.05,
+    day_weights={14.0: 0.6, 30.0: 1.0},
+    ec_initial_logits=(-1.4, 0.9, 0.6),
+)
+
+model = AdvancedVWModel(cfg)
+fit_res = model.fit(df, injections=injections)
+eval_df, overall_mae, overall_rmse, by_comp = evaluate_all_observed_points(model, df)
+time_err = summarize_timepoint_errors(eval_df)
+
+by_comp = by_comp.sort_values(["RMSE", "MAE"]).reset_index(drop=True)
+best_comp = by_comp.iloc[0]
+worst_comp = by_comp.iloc[-1]
+
+summary_table = pd.DataFrame(
+    {
+        "Metric": ["Overall MAE", "Overall RMSE", "Optimization success"],
+        "Value": [round(float(overall_mae), 4), round(float(overall_rmse), 4), bool(fit_res.success)],
+    }
+)
+
+by_comp_display = by_comp.copy()
+by_comp_display["Compartment"] = by_comp_display["wall"].str.capitalize() + " / " + by_comp_display["region"].str.capitalize()
+by_comp_display = by_comp_display[["Compartment", "MAE", "RMSE", "n"]].copy()
+by_comp_display["MAE"] = by_comp_display["MAE"].round(4)
+by_comp_display["RMSE"] = by_comp_display["RMSE"].round(4)
+
+time_err_display = time_err.copy()
+time_err_display["Timepoint"] = time_err_display["day"].apply(lambda x: f"P{int(x)}")
+time_err_display = time_err_display[["Timepoint", "MAE", "RMSE", "mean_residual", "n"]]
+time_err_display[["MAE", "RMSE", "mean_residual"]] = time_err_display[["MAE", "RMSE", "mean_residual"]].round(4)
+
+best_wall, best_region = str(best_comp["wall"]), str(best_comp["region"])
+worst_wall, worst_region = str(worst_comp["wall"]), str(worst_comp["region"])
+```
+
+## Raw observed data
+
+```{python}
+plot_raw_data(df)
+```
+
+- Before fitting, the observed data already show strong compartment-to-compartment variation
+- P14 tends to be the noisiest timepoint, so I downweighted it slightly during fitting
+- This means the model has to capture real heterogeneity rather than one global trajectory
+
+::: notes
+This is my one raw-data slide. I use it to show that the problem is genuinely heterogeneous and that P14 is a noisy intermediate stage rather than a clean linear transition.
+:::
+
+## Overall fit summary
+
+```{python}
+summary_table
+```
+
+```{python}
+by_comp_display
+```
+
+- Overall fit is summarized with **MAE** and **RMSE** across all observed compartment-timepoint pairs
+- I also break the errors down by compartment because performance is clearly not uniform
+
+::: notes
+The important point here is that I am not hiding the weak compartments. I wanted the model assessment to be transparent, so I show both the global fit and the compartment-level fit.
+:::
+
+## Error by compartment
+
+```{python}
+plot_rmse_by_compartment(by_comp)
+```
+
+- Lower RMSE means that the predicted stem cell fraction stayed closer to the observed data
+- The spread in RMSE shows that some compartments are much easier to model than others
+- This suggests that the ventricular wall is not following one uniform developmental rule
+
+::: notes
+I would point out which compartments are easiest versus hardest and say that this likely reflects a combination of biological heterogeneity and small-number stochastic effects.
+:::
+
+## Error by timepoint
+
+```{python}
+time_err_display
+```
+
+```{python}
+plot_timepoint_errors(time_err)
+```
+
+- This lets me compare whether the model performs differently at P7, P14, and P30
+- P14 often behaves like the hardest intermediate stage because it sits between the initial state and the later mature state
+
+::: notes
+This slide helps explain why the model may look decent overall but still struggle more at P14. It is a transient, higher-variance point, which is why I wanted timepoint-specific error summaries.
+:::
+
+## Predicted vs observed
+
+```{python}
+plot_predicted_vs_observed(eval_df)
+```
+
+- Points closer to the diagonal indicate better agreement between model and data
+- The model generally captures the direction of change, even when exact compartment-level fit is imperfect
+
+::: notes
+I would say that this plot is useful because it answers the simplest predictive question: are the predicted values landing near the observed values overall?
+:::
+
+## Residual pattern by time
+
+```{python}
+plot_residuals_by_time(eval_df)
+```
+
+- Residuals above zero mean the model overpredicted %SC
+- Residuals below zero mean the model underpredicted %SC
+- This helps show whether there is a systematic bias at particular timepoints
+
+::: notes
+If residuals cluster around zero, that is reassuring. If one timepoint shows a clear directional bias, that tells me the temporal part of the model may still need work.
+:::
+
+## Best-fitting compartment: SC and EC together
+
+```{python}
+plot_compartment_fit_with_EC(model, df, wall=best_wall, region=best_region)
+```
+
+- This panel shows both sides of the same biology: stem cell depletion and ependymal accumulation
+- The top plot is %SC and the bottom plot is %EC
+- The shaded band is the Monte Carlo uncertainty interval
+
+::: notes
+This is useful because it shows the model at its strongest. I can point out that when the fit is good, the framework captures both the loss of stem cells and the rise in ependymal cells in a biologically coherent way.
+:::
+
+## Hardest compartment: SC and EC together
+
+```{python}
+plot_compartment_fit_with_EC(model, df, wall=worst_wall, region=worst_region)
+```
+
+- This is the compartment where the model had the largest RMSE
+- Showing the weakest fit is important because it reveals where the assumptions are probably too simple
+- These are the regions most likely to benefit from improved fate modeling or better pooling across compartments
+
+::: notes
+I would be honest here and say this is where the current version struggles. That does not make the model useless. It tells me exactly where the next iteration should focus.
+:::
+
+## All compartments as %EC trajectories
+
+```{python}
+plot_all_ec_trajectories(model, df)
+```
+
+- I included this slide because the biological story is not only about stem cell loss
+- Looking at %EC makes the maturation pattern easier to see visually across all six compartments
+- This also makes it easier to compare how rapidly each compartment approaches a more ependymal-dominant state
+
+::: notes
+This slide helps the audience see the whole ventricular wall at once. I like it because it makes the compartment-specific maturation pattern much more obvious than a single global curve.
+:::
+
+## What the results suggest
+
+- The model captures the broad shift from stem-cell-rich to ependymal-cell-rich compartments.
+- Fit is compartment dependent rather than uniform.
+- Some compartments are predicted well, while others show larger residuals and wider uncertainty.
+- This suggests that the ventricular wall does not follow one single developmental rule.
+
+## Problems and limitations
+
+- The model does not explicitly account for measurement error, migration, or cell death.
+- Ependymal cells are not given their own proliferative dynamics.
+- The hardest compartments likely need stronger regularization or a more flexible temporal structure.
+- P14 remains the noisiest intermediate stage.
+
+::: notes
+I would frame this as: these are the current limitations of the model, not reasons the project failed. They also explain why some compartments are much harder than others.
+:::
+
+## What I finished this semester
+
+- Built and fit a compartment-specific predictive model rather than only describing the raw data.
+- Added a more flexible time structure and uncertainty quantification.
+- Evaluated performance using overall error, compartment error, timepoint error, predicted-versus-observed plots, and residuals.
+- Extended the interpretation from %SC alone to both %SC and %EC.
+
+::: notes
+This slide is useful if someone asks what the actual contribution of the semester was. The answer is that I moved from descriptive summaries to a real predictive and evaluative modeling workflow.
+:::
+
+## Next steps
+
+- Estimate more of the temporal and fate parameters directly from the data
+- Add stronger stabilization for compartments with higher variance
+- Test whether alternative apical-area terms improve prediction
+- Incorporate replicate-level raw data when available instead of relying only on compartment summaries
+- Compare this framework against simpler baselines or pooled models more formally
+
+::: notes
+I would end by saying the next stage is not to throw the model away. It is to improve the parts that the results showed are weak.
+:::
+
+## Take-home message
+
+- The ventricular wall does **not** behave as one uniform developmental system
+- A compartment-specific predictive model can recover much of the observed structure
+- The strongest result is not just one good curve, but a full framework that shows where prediction works and where it breaks
+- That gives me a clear path for the next version of the project
+
+::: notes
+This is the last slide. I would keep it simple and say that the value of the project is that it turns sparse biological observations into a testable predictive framework.
+:::
+
+# Thank You! 
