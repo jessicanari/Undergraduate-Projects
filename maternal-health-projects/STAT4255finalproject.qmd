@@ -1,0 +1,350 @@
+---
+title: "STAT 4255 Final Project"
+author: "Jessica Yoon"
+format:
+  pdf:
+    fontsize: 10pt
+    geometry: "margin=0.8in"
+    linestretch: 0.5
+execute:
+  echo: false
+  warning: false
+  message: false
+  output: true
+---
+## Executive Summary 
+Maternal mortality and pregnancy-related complications remain major public health concerns. Early identification of higher-risk pregnancies using simple clinical measurements can support timely intervention, particularly in settings with limited diagnostic resources. This project used the Maternal Health Risk Dataset (n = 1,014) to predict RiskLevel (low, mid, high) from Age, SystolicBP, DiastolicBP, BS (blood sugar), BodyTemp, and HeartRate using supervised multiclass classification.
+
+Class balance was modest and not severely skewed: low risk (406, 40.0%), mid risk (336, 33.1%), and high risk (272, 26.8%). A baseline majority-class model achieved 0.399 accuracy with a low macro-F1 of 0.190, confirming that meaningful modeling is required beyond naive prediction. A multinomial logistic regression model improved performance to 0.6207 accuracy and 0.6101 macro-F1, suggesting a moderate ability to separate risk categories using linear relationships among predictors. A random forest classifier substantially outperformed the linear approach, achieving 0.8571 accuracy and 0.8652 macro-F1 on the test set. Five-fold cross-validation supported the stability of these findings: logistic regression accuracy 0.6173 ± 0.0312 and macro-F1 0.6046 ± 0.0323, compared with random forest accuracy 0.8501 ± 0.0237 and macro-F1 0.855 ± 0.0221.
+
+The random forest performed especially well for the high-risk group (precision 0.96, recall 0.95, F1 0.95). Misclassifications primarily occurred between low and mid risk, suggesting that borderline clinical profiles are harder to separate with this limited feature set. Feature importance from the random forest indicated that blood sugar (0.349) and systolic blood pressure (0.192) were the strongest predictors, followed by age (0.160) and diastolic blood pressure (0.127). These results suggest that nonlinear patterns among glycemic and cardiovascular indicators meaningfully improve risk classification in this dataset.
+
+Overall, the analysis supports the feasibility of predicting maternal risk levels using basic physiologic data. However, missing clinical variables such as BMI, gestational age, comorbidity history, and medication use likely limit broader generalizability. The models should therefore be interpreted as a course-based demonstration of clinically motivated classification rather than a deployed decision support tool.
+
+## Data Description
+
+Maternal mortality and pregnancy-related complications remain major public health concerns. Physiologic abnormalities such as elevated blood pressure, abnormal blood glucose, fever, and tachycardia can signal increased risk for adverse maternal outcomes. In many settings, particularly those with limited access to advanced diagnostics, early risk stratification using simple clinical measurements may help target monitoring and intervention.
+
+This project uses the Maternal Health Risk Dataset, which contains 1,014 observations and 7 variables. Each row represents a pregnant woman’s health record. Predictors include Age, SystolicBP, DiastolicBP, BS (blood sugar), BodyTemp, and HeartRate. The outcome, RiskLevel, is a categorical label with three classes: low, mid, and high risk.
+
+## Questions of Interest 
+-  Which clinical features appear most strongly associated with higher risk categories?
+- Can a supervised classification model accurately predict maternal risk using only these basic vital measurements?
+- Do nonlinear relationships or interactions (for example between age and blood pressure, or systolic and diastolic BP jointly) improve predictive performance?
+
+## Approaches Considered and Explored 
+
+Exploratory Data Analysis (EDA)
+
+ - Initial exploration focused on understanding variable distributions, potential outliers, and correlation structure. Particular attention was given to the relationship between systolic and diastolic blood pressure and how these variables may jointly map onto risk category.
+
+Baseline models
+
+ - A simple baseline classifier (for example, predicting the majority class) was considered to establish a minimum performance threshold and to contextualize improvements from more structured statistical models.
+
+Multinomial logistic regression
+
+- This model offers interpretability and provides estimated effects for each predictor across the three risk categories. It also serves as a strong benchmark for clinical-style modeling when the goal is both prediction and explanation.
+
+Tree-based methods (decision tree, random forest)
+
+- Tree models can accommodate nonlinear relationships and interactions without requiring explicit specification. Random forests, in particular, were considered to reduce overfitting relative to a single tree and to provide stable estimates of feature importance.
+
+Other potential models 
+
+- More complex methods such as support vector machines or gradient boosting were considered as optional extensions, depending on performance and course expectations.
+
+## Final Approach and Reasoning 
+The final modeling strategy focused on balancing predictive performance with clinical interpretability.
+
+A reasonable final structure is: 
+
+Train-test split (or cross-validation)
+
+- The dataset was divided into training and testing sets to evaluate generalization performance.
+
+Model 1: Multinomial logistic regression
+
+- This model was used as an interpretable benchmark. It allows direct inference about the direction and relative strength of associations between predictors (for example, higher blood sugar or elevated blood pressure) and increased risk levels.
+
+Model 2: Random forest classifier
+
+- This model was selected to capture potential nonlinear effects and interactions among physiologic variables. The random forest also provides robust feature importance estimates that can complement the inferential framing of logistic regression.
+
+Evaluation metrics
+
+- Performance was assessed using:
+
+  - Overall accuracy
+  - Confusion matrix
+  - Macro-F1 (especially if class imbalance is present)
+
+Multinomial logistic regression offers transparency and clinically familiar interpretation. Random forest provides a flexible counterpart that can better model complex relationships with minimal assumptions. Comparing these two models clarifies whether increased complexity meaningfully improves prediction.
+
+## Results 
+Class Balance and Baseline Performance
+- The dataset included 1,014 maternal health records across three risk categories: low risk (406, 40.0%), mid risk (336, 33.1%), and high risk (272, 26.8%). This distribution suggests moderate imbalance but not an extreme case requiring aggressive resampling. A baseline majority-class classifier achieved 0.399 accuracy and a macro-F1 of 0.190. The baseline confusion matrix showed that the model overwhelmingly predicted the most frequent class, reinforcing that meaningful model structure is necessary to capture clinically relevant separation among categories.
+
+Model Comparison
+- A multinomial logistic regression model achieved 0.6207 accuracy and 0.6101 macro-F1 on the held-out test set. This performance represents a substantial improvement over baseline and indicates that linear associations between physiologic features and risk category carry moderate predictive signal. However, the model’s midrange performance also suggests that risk categorization is not fully captured by linear effects alone.
+
+A random forest classifier provided a large performance gain, achieving 0.8571 accuracy and 0.8652 macro-F1. The confusion matrix indicates strong classification of high risk cases (52 correctly classified out of 55), with most errors arising between low and mid risk categories. Class-wise metrics further clarify this pattern: high risk achieved precision 0.96, recall 0.95, and F1 0.95; low risk showed precision 0.88, recall 0.80, and F1 0.84; mid risk demonstrated precision 0.76, recall 0.85, and F1 0.80. This suggests that mid risk is the most heterogeneous category, increasing overlap with adjacent groups.
+
+Cross-Validation
+- Five-fold cross-validation confirmed the robustness of these findings. Logistic regression showed stable but moderate performance (accuracy 0.6173 ± 0.0312; macro-F1 0.6046 ± 0.0323). Random forest performance was consistently higher with relatively low variance (accuracy 0.8501 ± 0.0237; macro-F1 0.855 ± 0.0221). The improvement across both test and cross-validated metrics supports the conclusion that nonlinear patterns and interactions among predictors meaningfully enhance maternal risk classification for this dataset.
+
+Feature Importance
+- Random forest feature importance ranked BS (0.349) as the strongest predictor, followed by SystolicBP (0.192), Age (0.160), DiastolicBP (0.127), HeartRate (0.104), and BodyTemp (0.068). This ordering is clinically plausible and suggests that glycemic status and blood pressure carry the clearest signal for risk differentiation in this dataset, while temperature and heart rate contribute smaller but potentially additive effects.
+
+| Model                           | Test Accuracy | Test Macro-F1 | 5-Fold CV Accuracy (mean ± SD) | 5-Fold CV Macro-F1 (mean ± SD) |
+| ------------------------------- | ------------: | ------------: | -----------------------------: | -----------------------------: |
+| Baseline (majority class)       |         0.399 |         0.190 |                              — |                              — |
+| Multinomial Logistic Regression |        0.6207 |        0.6101 |                0.6173 ± 0.0312 |                0.6046 ± 0.0323 |
+| Random Forest                   |        0.8571 |        0.8652 |                0.8501 ± 0.0237 |                0.8550 ± 0.0221 |
+
+## Conclusion 
+The results indicate that maternal risk level can be predicted with high accuracy using a limited set of physiologic indicators, with random forest substantially outperforming multinomial logistic regression. The strong random forest macro-F1 (0.8652) and consistent cross-validation performance suggest that nonlinear relationships among predictors add meaningful signal beyond linear effects. Blood sugar and blood pressure emerged as the most influential predictors, aligning with clinical expectations that glycemic and cardiovascular instability are central markers of maternal risk. The main remaining challenge appears to be distinguishing low from mid risk cases, likely reflecting overlapping or transitional clinical profiles. Given the dataset’s missing covariates and uncertain external context, these findings are best interpreted as a robust demonstration of supervised multiclass classification in a clinically relevant setting.
+
+## Technical Appendix
+#### A1. Dataset and Variables
+
+The Maternal Health Risk Dataset contains 1,014 observations. Each observation represents a pregnant woman’s health record. Predictors include:
+
+- Age
+- SystolicBP
+- DiastolicBP
+- BS (blood sugar)
+- BodyTemp
+- HeartRate
+
+The outcome variable is:
+
+- RiskLevel (low risk, mid risk, high risk)
+
+##### A1.1 Class distribution
+Observed class counts and proportions:
+
+- low risk: 406 (0.400)
+- mid risk: 336 (0.331)
+- high risk: 272 (0.268)
+
+This distribution indicates moderate imbalance but not an extreme majority-class dominance.
+
+##### A2. Data Loading and Basic Checks
+
+```{python}
+import pandas as pd
+
+df = pd.read_csv("/Users/jessicayoon/Downloads/maternal_health_risk_dataset.csv")
+df.columns = [c.strip() for c in df.columns]
+
+df.head()
+```
+
+```{python}
+df.info()
+```
+
+#### A3. Exploratory Data Analysis
+
+The following figures support the interpretation of model performance and feature relevance.
+
+##### A3.1 Distribution summaries
+```{python}
+import matplotlib.pyplot as plt
+
+num_cols = ["Age","SystolicBP","DiastolicBP","BS","BodyTemp","HeartRate"]
+
+for col in num_cols:
+    plt.figure()
+    df[col].hist(bins=30)
+    plt.title(f"Distribution of {col}")
+    plt.xlabel(col)
+    plt.ylabel("Count")
+    plt.show()
+```
+
+##### A3.2 Predictor differences by RiskLevel
+```{python}
+for col in num_cols:
+    plt.figure()
+    df.boxplot(column=col, by="RiskLevel")
+    plt.title(f"{col} by RiskLevel")
+    plt.suptitle("")
+    plt.xlabel("RiskLevel")
+    plt.ylabel(col)
+    plt.show()
+```
+
+##### A3.3 Correlation structure
+```{python}
+import numpy as np
+
+corr = df[num_cols].corr()
+
+plt.figure()
+plt.imshow(corr)
+plt.title("Correlation Matrix (Numeric Predictors)")
+plt.xticks(range(len(num_cols)), num_cols, rotation=45, ha="right")
+plt.yticks(range(len(num_cols)), num_cols)
+plt.colorbar()
+plt.tight_layout()
+plt.show()
+```
+
+### A4. Modeling Pipeline and Evaluation
+
+##### A4.1 Train-test split
+A stratified 80/20 split was used to preserve class proportions across training and test sets.
+```{python}
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+y = df["RiskLevel"].astype(str).str.strip()
+X = df.drop(columns=["RiskLevel"])
+
+X_train, X_test, y_train, y_test = train_test_split(
+X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+X_train.shape, X_test.shape
+```
+
+##### A4.2 Baseline classifier
+A majority-class baseline provides a reference for the minimum expected performance.
+
+Test results:
+- Accuracy: 0.399
+-Macro-F1: 0.1901
+```{python}
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+baseline = DummyClassifier(strategy="most_frequent")
+baseline.fit(X_train, y_train)
+base_pred = baseline.predict(X_test)
+
+accuracy_score(y_test, base_pred), f1_score(y_test, base_pred, average="macro"), confusion_matrix(y_test, base_pred)
+```
+
+##### A4.3 Multinomial logistic regression
+This model serves as an interpretable benchmark.
+
+Test results:
+- Accuracy: 0.6207
+- Macro-F1: 0.6101
+
+5-fold CV:
+- Accuracy: 0.6173 ± 0.0312
+- Macro-F1: 0.6046 ± 0.0323
+```{python}
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+
+logit = Pipeline([
+("scaler", StandardScaler()),
+("model", LogisticRegression(
+multi_class="multinomial",
+solver="lbfgs",
+max_iter=500
+))
+])
+
+logit.fit(X_train, y_train)
+logit_pred = logit.predict(X_test)
+
+print("Accuracy:", round(accuracy_score(y_test, logit_pred), 4))
+print("Macro-F1:", round(f1_score(y_test, logit_pred, average="macro"), 4))
+print("Confusion matrix:\n", confusion_matrix(y_test, logit_pred))
+print("\nClassification report:\n", classification_report(y_test, logit_pred))
+```
+
+##### A4.4 Random forest
+This model was used to capture nonlinear relationships and interactions.
+
+5-fold CV:
+- Accuracy: 0.8501 ± 0.0237
+- Macro-F1: 0.8550 ± 0.0221
+
+```{python}
+from sklearn.ensemble import RandomForestClassifier
+
+rf = RandomForestClassifier(
+n_estimators=500,
+random_state=42
+)
+
+rf.fit(X_train, y_train)
+rf_pred = rf.predict(X_test)
+
+print("Accuracy:", round(accuracy_score(y_test, rf_pred), 4))
+print("Macro-F1:", round(f1_score(y_test, rf_pred, average="macro"), 4))
+print("Confusion matrix:\n", confusion_matrix(y_test, rf_pred))
+print("\nClassification report:\n", classification_report(y_test, rf_pred))
+```
+
+#### A5. Feature Importance
+
+Random forest feature importance ranks the predictors as:
+
+- BS (0.349)
+- SystolicBP (0.192)
+- Age (0.160)
+- DiastolicBP (0.127)
+- HeartRate (0.104)
+- BodyTemp (0.068)
+
+```{python}
+import pandas as pd
+
+importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+importances
+```
+
+```{python}
+import matplotlib.pyplot as plt
+
+plt.figure()
+importances.sort_values().plot(kind="barh")
+plt.title("Random Forest Feature Importance")
+plt.xlabel("Importance")
+plt.ylabel("Feature")
+plt.tight_layout()
+plt.show()
+```
+
+#### A6. Cross-Validation Code
+```{python}
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+logit_cv_acc = cross_val_score(logit, X, y, cv=skf, scoring="accuracy")
+logit_cv_f1  = cross_val_score(logit, X, y, cv=skf, scoring="f1_macro")
+
+rf_cv_acc = cross_val_score(rf, X, y, cv=skf, scoring="accuracy")
+rf_cv_f1  = cross_val_score(rf, X, y, cv=skf, scoring="f1_macro")
+
+print("Logit Acc:", round(logit_cv_acc.mean(), 4), "+/-", round(logit_cv_acc.std(), 4))
+print("Logit F1 :", round(logit_cv_f1.mean(), 4), "+/-", round(logit_cv_f1.std(), 4))
+print("RF Acc   :", round(rf_cv_acc.mean(), 4), "+/-", round(rf_cv_acc.std(), 4))
+print("RF F1    :", round(rf_cv_f1.mean(), 4), "+/-", round(rf_cv_f1.std(), 4))
+```
+
+#### A7. Compact Summary Table
+```{python}
+results = pd.DataFrame([
+{"Model": "Baseline", "Test Accuracy": 0.399, "Test Macro-F1": 0.1901},
+{"Model": "Multinomial Logistic Regression", "Test Accuracy": 0.6207, "Test Macro-F1": 0.6101},
+{"Model": "Random Forest", "Test Accuracy": 0.8571, "Test Macro-F1": 0.8652},
+])
+
+results
+```
+
+#### A8. Limitations 
+- The dataset excludes known clinical covariates that plausibly influence risk labels (e.g., gestational age, BMI, comorbidities, prior obstetric history).
+- The RiskLevel labels may encode clinical decision thresholds or institutional heuristics not fully explained by the six predictors, which may limit transferability to other populations.
+- The strong improvement of random forest over logistic regression suggests meaningful nonlinearities and interactions; however, interpretability of ensemble decision logic is more limited.
